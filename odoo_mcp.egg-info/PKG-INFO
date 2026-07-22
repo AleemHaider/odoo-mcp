@@ -1,3 +1,16 @@
+Metadata-Version: 2.4
+Name: odoo-mcp
+Version: 0.1.0
+Summary: MCP server that wraps the Odoo external API (XML-RPC) as 13 tools for Claude and other MCP clients.
+Author: aleemhaider
+License: MIT
+Project-URL: Homepage, https://github.com/AleemHaider/odoo-mcp
+Project-URL: Repository, https://github.com/AleemHaider/odoo-mcp
+Keywords: odoo,mcp,model-context-protocol,claude,xmlrpc,erp
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: fastmcp>=2.0.0
+
 # Odoo MCP Multi (own build)
 
 A from-scratch, open MCP server that turns Claude (or any MCP client) into an
@@ -35,27 +48,7 @@ Everything ultimately routes through one call:
 
 ---
 
-## Quick install — one command, no clone (recommended)
-
-Requires [`uv`](https://docs.astral.sh/uv/) (`pip install uv`). This fetches the
-code straight from GitHub, installs it in an isolated env, and registers it with
-Claude — credentials are passed inline as env vars, so there's no file to edit:
-
-```bash
-claude mcp add odoo -s user \
-  -e ODOO_URL=https://your-instance.odoo.com \
-  -e ODOO_DB=your-db-name \
-  -e ODOO_USER=you@company.com \
-  -e ODOO_PASSWORD=your-api-key \
-  -- uvx --from git+https://github.com/AleemHaider/odoo-mcp odoo-mcp
-```
-
-That's the whole install. Start Claude and ask *"List my Odoo profiles"*.
-For multiple Odoo instances, use the `profiles.json` flow below instead.
-
----
-
-## Setup (manual / multi-profile)
+## Setup
 
 ### 1. Install
 ```bash

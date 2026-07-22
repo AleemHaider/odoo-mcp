@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "odoo-mcp"
+version = "0.1.0"
+description = "MCP server that wraps the Odoo external API (XML-RPC) as 13 tools for Claude and other MCP clients."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "aleemhaider" }]
+keywords = ["odoo", "mcp", "model-context-protocol", "claude", "xmlrpc", "erp"]
+dependencies = ["fastmcp>=2.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/AleemHaider/odoo-mcp"
+Repository = "https://github.com/AleemHaider/odoo-mcp"
+
+# Exposes the `odoo-mcp` command -> server.main().
+# Enables:  uvx --from git+https://github.com/AleemHaider/odoo-mcp odoo-mcp
+[project.scripts]
+odoo-mcp = "server:main"
+
+[tool.setuptools]
+# Single top-level module; smoke_test.py stays out of the installed package.
+py-modules = ["server"]

@@ -23,16 +23,45 @@ import ast
 import csv
 import io
 import json
+import logging
 import os
 import sys
+import threading
+import time
 import xmlrpc.client
-from functools import lru_cache, wraps
+from functools import wraps
 from html import escape
 from typing import Any
 
 from fastmcp import FastMCP
 
 mcp = FastMCP("Odoo MCP Multi")
+
+# --------------------------------------------------------------------------- #
+# 0. Runtime configuration (production hardening)
+# --------------------------------------------------------------------------- #
+# Network timeout for every XML-RPC call (seconds). No timeout = hung requests.
+ODOO_TIMEOUT = float(os.environ.get("ODOO_TIMEOUT", "30"))
+# How many times to retry a call after a transient/network failure.
+ODOO_MAX_RETRIES = int(os.environ.get("ODOO_MAX_RETRIES", "2"))
+# Base backoff (seconds) between retries; grows exponentially.
+ODOO_RETRY_BACKOFF = float(os.environ.get("ODOO_RETRY_BACKOFF", "0.5"))
+
+# Structured logging to stderr (stdout is reserved for the MCP protocol).
+_LOG_LEVEL = os.environ.get("ODOO_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    stream=sys.stderr,
+    format='{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":%(message)s}',
+)
+log = logging.getLogger("odoo_mcp")
+audit = logging.getLogger("odoo_mcp.audit")
+
+
+def _jlog(logger, level, event: str, **fields) -> None:
+    """Emit a single structured (JSON) log line."""
+    payload = {"event": event, **fields}
+    logger.log(level, json.dumps(payload, ensure_ascii=False, default=str))
 
 # --------------------------------------------------------------------------- #
 # 1. Profile configuration (defined on the HOST, never inside Claude)
@@ -86,59 +115,129 @@ class OdooError(Exception):
     """Raised for anything that should be returned as {success: false, error}."""
 
 
-@lru_cache(maxsize=None)
-def _authenticate(profile_name: str) -> tuple[Any, str, int, str]:
-    """Authenticate against Odoo and cache (models_proxy, db, uid, password).
+# Cache the authenticated uid per profile so we don't re-auth on every call, but
+# NOT the ServerProxy objects (xmlrpc.client is not thread-safe). Guarded by a
+# lock; invalidated and refreshed if Odoo reports the session died.
+_UID_CACHE: dict[str, int] = {}
+_UID_LOCK = threading.Lock()
 
-    Cached per-profile so we don't re-authenticate on every tool call.
-    """
-    p = PROFILES.get(profile_name)
+
+def _proxy(url: str, endpoint: str) -> xmlrpc.client.ServerProxy:
+    """A fresh, timeout-bounded ServerProxy. New per call → thread-safe."""
+    transport = xmlrpc.client.SafeTransport() if url.startswith("https") \
+        else xmlrpc.client.Transport()
+    # xmlrpc has no timeout knob; inject one via the connection factory.
+    _orig = transport.make_connection
+
+    def _make(host):
+        conn = _orig(host)
+        conn.timeout = ODOO_TIMEOUT
+        return conn
+
+    transport.make_connection = _make  # type: ignore[assignment]
+    return xmlrpc.client.ServerProxy(f"{url.rstrip('/')}{endpoint}",
+                                     transport=transport, allow_none=True)
+
+
+def _profile_cfg(profile: str | None) -> tuple[str, dict]:
+    name = profile or DEFAULT_PROFILE
+    p = PROFILES.get(name)
     if p is None:
         raise OdooError(
-            f"Unknown profile '{profile_name}'. "
-            f"Available: {', '.join(PROFILES) or '(none)'}."
+            f"Unknown profile '{name}'. Available: {', '.join(PROFILES) or '(none)'}."
         )
+    return name, p
 
-    url = p["url"].rstrip("/")
-    db = p["database"]
-    user = p["username"]
-    key = p["password"]
 
-    common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True)
+def _authenticate(name: str, cfg: dict, force: bool = False) -> int:
+    """Return a cached uid for the profile, authenticating if needed."""
+    if not force:
+        with _UID_LOCK:
+            if name in _UID_CACHE:
+                return _UID_CACHE[name]
+
+    url, db, user, key = cfg["url"].rstrip("/"), cfg["database"], cfg["username"], cfg["password"]
     try:
-        uid = common.authenticate(db, user, key, {})
+        uid = _proxy(url, "/xmlrpc/2/common").authenticate(db, user, key, {})
     except Exception as exc:  # network / xmlrpc faults
         raise OdooError(f"Could not reach Odoo at {url}: {exc}") from exc
-
     if not uid:
         raise OdooError(
             f"Authentication failed for user '{user}' on database '{db}'. "
             "Check username / password (or API key) / database name."
         )
+    with _UID_LOCK:
+        _UID_CACHE[name] = uid
+    _jlog(log, logging.INFO, "authenticated", profile=name, uid=uid, url=url)
+    return uid
 
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
-    return models, db, uid, key
 
-
-def _client(profile: str | None) -> tuple[Any, str, int, str]:
-    return _authenticate(profile or DEFAULT_PROFILE)
+def _invalidate(name: str) -> None:
+    with _UID_LOCK:
+        _UID_CACHE.pop(name, None)
 
 
 def _is_readonly(profile: str | None) -> bool:
     return bool(PROFILES.get(profile or DEFAULT_PROFILE, {}).get("readonly"))
 
 
+def _is_session_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return any(s in m for s in ("session expired", "session invalid",
+                                "invalid uid", "your session"))
+
+
 def _kw(profile: str | None, model: str, method: str,
         args: list | None = None, kwargs: dict | None = None) -> Any:
-    """The single choke point: everything routes through execute_kw."""
-    models, db, uid, key = _client(profile)
-    try:
-        return models.execute_kw(db, uid, key, model, method, args or [], kwargs or {})
-    except xmlrpc.client.Fault as fault:
-        # Odoo packs the useful message into faultString.
-        raise OdooError(_clean_fault(fault.faultString)) from fault
-    except Exception as exc:
-        raise OdooError(str(exc)) from exc
+    """The single choke point: everything routes through execute_kw.
+
+    Hardened: fresh proxy per call (thread-safe), bounded timeout, retry with
+    backoff on transient failures, and one automatic re-auth if the session died.
+    """
+    name, cfg = _profile_cfg(profile)
+    url, db, key = cfg["url"].rstrip("/"), cfg["database"], cfg["password"]
+    started = time.monotonic()
+    last_exc: Exception | None = None
+
+    for attempt in range(ODOO_MAX_RETRIES + 1):
+        uid = _authenticate(name, cfg)
+        try:
+            proxy = _proxy(url, "/xmlrpc/2/object")
+            result = proxy.execute_kw(db, uid, key, model, method,
+                                      args or [], kwargs or {})
+            _jlog(log, logging.DEBUG, "rpc_ok", profile=name, model=model,
+                  method=method, ms=round((time.monotonic() - started) * 1000))
+            return result
+        except xmlrpc.client.Fault as fault:
+            clean = _clean_fault(fault.faultString)
+            # A dead session: drop the uid and retry once with a fresh auth.
+            if _is_session_error(fault.faultString) and attempt < ODOO_MAX_RETRIES:
+                _jlog(log, logging.WARNING, "session_refresh", profile=name)
+                _invalidate(name)
+                last_exc = fault
+                continue
+            # A genuine business/validation error — do not retry.
+            raise OdooError(clean) from fault
+        except (TimeoutError, ConnectionError, OSError) as exc:
+            last_exc = exc
+            if attempt < ODOO_MAX_RETRIES:
+                backoff = ODOO_RETRY_BACKOFF * (2 ** attempt)
+                _jlog(log, logging.WARNING, "rpc_retry", profile=name, model=model,
+                      method=method, attempt=attempt + 1, backoff=backoff, error=str(exc))
+                time.sleep(backoff)
+                continue
+            raise OdooError(f"Odoo call failed after {attempt + 1} attempts: {exc}") from exc
+        except Exception as exc:
+            raise OdooError(str(exc)) from exc
+
+    raise OdooError(f"Odoo call failed: {last_exc}")
+
+
+def _audit(profile: str | None, model: str, method: str, **detail) -> None:
+    """Record every mutation: who/what/when — the roadmap's audit_log."""
+    name, cfg = _profile_cfg(profile)
+    _jlog(audit, logging.INFO, "mutation", profile=name, user=cfg.get("username"),
+          model=model, method=method, **detail)
 
 
 def _clean_fault(msg: str) -> str:
@@ -358,11 +457,10 @@ def get_version(profile: str | None = None) -> dict:
 
     Useful to decide method/field compatibility per version.
     """
-    models, db, uid, key = _client(profile)
-    url = PROFILES[profile or DEFAULT_PROFILE]["url"].rstrip("/")
-    common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True)
-    info = common.version()
-    return _ok({"profile": profile or DEFAULT_PROFILE, "version": info})
+    name, cfg = _profile_cfg(profile)
+    _authenticate(name, cfg)  # verifies connectivity + credentials
+    info = _proxy(cfg["url"], "/xmlrpc/2/common").version()
+    return _ok({"profile": name, "version": info})
 
 
 @mcp.tool()
@@ -578,6 +676,7 @@ def create(model: str, values: Any, profile: str | None = None) -> dict:
     _guard_write(profile)
     vals = _parse_values(values)
     new_id = _kw(profile, model, "create", [vals])
+    _audit(profile, model, "create", new_id=new_id, fields=list(vals))
     return _ok({"id": new_id})
 
 
@@ -593,6 +692,7 @@ def write(model: str, ids: Any, values: Any, profile: str | None = None) -> dict
     id_list = _parse_ids(ids)
     vals = _parse_values(values)
     _kw(profile, model, "write", [id_list, vals])
+    _audit(profile, model, "write", ids=id_list, fields=list(vals))
     return _ok({"written_ids": id_list})
 
 
@@ -608,6 +708,7 @@ def unlink(model: str, ids: Any, profile: str | None = None) -> dict:
     _guard_write(profile)
     id_list = _parse_ids(ids)
     _kw(profile, model, "unlink", [id_list])
+    _audit(profile, model, "unlink", ids=id_list)
     return _ok({"deleted_ids": id_list})
 
 
@@ -640,6 +741,8 @@ def execute_kw(model: str, method: str, args: Any = None, kwargs: Any = None,
         json.loads(kwargs) if isinstance(kwargs, str) and kwargs.strip() else {})
 
     result = _kw(profile, model, method, parsed_args, parsed_kwargs)
+    if method not in readonly_methods:
+        _audit(profile, model, method, via="execute_kw", args=parsed_args)
     return _ok({"result": result})
 
 
@@ -713,7 +816,9 @@ def import_records(model: str, fields: str, rows: Any, profile: str | None = Non
     if messages:
         return {"success": False, "error": "Import reported errors.",
                 "messages": messages, "ids": result.get("ids")}
-    return _ok({"ids": result.get("ids", []), "count": len(matrix)})
+    ids = result.get("ids", [])
+    _audit(profile, model, "load", via="import_records", count=len(matrix), ids=ids)
+    return _ok({"ids": ids, "count": len(matrix)})
 
 
 def _cell(value: Any) -> str:
@@ -734,16 +839,22 @@ def _cell(value: Any) -> str:
 def main() -> None:
     """Console-script entry point (see pyproject.toml [project.scripts]).
 
-    Lets the server be launched as `odoo-mcp` after install, including via
-    `uvx --from git+https://github.com/AleemHaider/odoo-mcp odoo-mcp`.
+    Transport is selected via env:
+      MCP_TRANSPORT=stdio   (default) — how Claude Desktop / Claude Code launch it.
+      MCP_TRANSPORT=http    — hosted/multi-user mode (streamable HTTP), bind with
+                              MCP_HOST (default 0.0.0.0) and MCP_PORT (default 8000).
     """
-    # stdio transport — how Claude Desktop / Claude Code launch a local server.
-    print(
-        f"[Odoo MCP Multi] profiles: {', '.join(PROFILES)} "
-        f"| default: {DEFAULT_PROFILE}",
-        file=sys.stderr,
-    )
-    mcp.run()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
+    _jlog(log, logging.INFO, "startup", transport=transport,
+          profiles=list(PROFILES), default=DEFAULT_PROFILE,
+          timeout=ODOO_TIMEOUT, max_retries=ODOO_MAX_RETRIES)
+
+    if transport in ("http", "streamable-http"):
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("MCP_PORT", "8000"))
+        mcp.run(transport="streamable-http", host=host, port=port)
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

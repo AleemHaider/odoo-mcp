@@ -1,0 +1,6 @@
+# Replace odoo-mcp.yourcompany.com with your real domain (DNS A record -> this VM).
+# Caddy automatically provisions and renews a Let's Encrypt TLS certificate.
+odoo-mcp.yourcompany.com {
+	encode gzip
+	reverse_proxy mcp:8000
+}

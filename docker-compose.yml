@@ -1,0 +1,42 @@
+# Turnkey multi-user deployment:  Caddy (auto-HTTPS) -> MCP server -> Odoo.
+# Employees connect to https://<your-domain>/mcp with a personal bearer token.
+# Credentials come from a local .env file; per-employee tokens from tokens.json.
+services:
+  mcp:
+    build: .
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      # --- Odoo connection (from .env) ---
+      ODOO_URL: ${ODOO_URL}
+      ODOO_DB: ${ODOO_DB}
+      ODOO_USER: ${ODOO_USER}
+      ODOO_PASSWORD: ${ODOO_PASSWORD}
+      # --- Safety: read-only for all employees ---
+      ODOO_READONLY: "1"
+      # --- Per-employee tokens (mounted below) ---
+      MCP_AUTH_TOKENS_FILE: /run/secrets/tokens.json
+      ODOO_LOG_LEVEL: INFO
+    volumes:
+      - ./tokens.json:/run/secrets/tokens.json:ro
+    expose:
+      - "8000"          # internal only — never published to the host
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"       # Caddy terminates TLS and proxies to mcp:8000
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - mcp
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

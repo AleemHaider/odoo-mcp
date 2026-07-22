@@ -57,6 +57,33 @@ logging.basicConfig(
 log = logging.getLogger("odoo_mcp")
 audit = logging.getLogger("odoo_mcp.audit")
 
+# Per-employee bearer tokens for hosted (HTTP) mode. Maps token -> employee name
+# so the audit log records WHO did what and tokens can be revoked individually.
+# Source: MCP_AUTH_TOKENS_FILE (JSON {"token": "name"}) or MCP_AUTH_TOKENS
+# ("tok1:Alice,tok2:Bob"). Empty = auth disabled (only safe on a private network).
+def _load_tokens() -> dict[str, str]:
+    f = os.environ.get("MCP_AUTH_TOKENS_FILE")
+    if f and os.path.exists(f):
+        with open(f, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    inline = os.environ.get("MCP_AUTH_TOKENS", "").strip()
+    if inline:
+        out = {}
+        for pair in inline.split(","):
+            if ":" in pair:
+                tok, name = pair.split(":", 1)
+                out[tok.strip()] = name.strip()
+        return out
+    return {}
+
+
+AUTH_TOKENS = _load_tokens()
+
+# The employee bound to the current request (for the audit log).
+import contextvars  # noqa: E402
+_CURRENT_USER: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "mcp_user", default="local")
+
 
 def _jlog(logger, level, event: str, **fields) -> None:
     """Emit a single structured (JSON) log line."""
@@ -236,7 +263,8 @@ def _kw(profile: str | None, model: str, method: str,
 def _audit(profile: str | None, model: str, method: str, **detail) -> None:
     """Record every mutation: who/what/when — the roadmap's audit_log."""
     name, cfg = _profile_cfg(profile)
-    _jlog(audit, logging.INFO, "mutation", profile=name, user=cfg.get("username"),
+    _jlog(audit, logging.INFO, "mutation", employee=_CURRENT_USER.get(),
+          profile=name, odoo_user=cfg.get("username"),
           model=model, method=method, **detail)
 
 
@@ -847,14 +875,50 @@ def main() -> None:
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
     _jlog(log, logging.INFO, "startup", transport=transport,
           profiles=list(PROFILES), default=DEFAULT_PROFILE,
-          timeout=ODOO_TIMEOUT, max_retries=ODOO_MAX_RETRIES)
+          timeout=ODOO_TIMEOUT, max_retries=ODOO_MAX_RETRIES,
+          auth_tokens=len(AUTH_TOKENS))
 
     if transport in ("http", "streamable-http"):
         host = os.environ.get("MCP_HOST", "0.0.0.0")
         port = int(os.environ.get("MCP_PORT", "8000"))
-        mcp.run(transport="streamable-http", host=host, port=port)
+        _run_http(host, port)
     else:
         mcp.run()
+
+
+def _run_http(host: str, port: int) -> None:
+    """Serve streamable HTTP with per-employee bearer-token auth."""
+    import uvicorn
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    tokens = AUTH_TOKENS
+    if not tokens:
+        _jlog(log, logging.WARNING, "auth_disabled",
+              note="No MCP_AUTH_TOKENS set — endpoint is UNAUTHENTICATED. "
+                   "Only run this on a private network or behind an authenticating proxy.")
+
+    class TokenAuth(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            # Allow unauthenticated health checks.
+            if request.url.path == "/healthz":
+                return JSONResponse({"status": "ok"})
+            if tokens:
+                auth = request.headers.get("authorization", "")
+                token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+                name = tokens.get(token)
+                if not name:
+                    _jlog(log, logging.WARNING, "auth_denied",
+                          path=request.url.path, ip=request.client.host if request.client else None)
+                    return JSONResponse({"error": "unauthorized"}, status_code=401)
+                _CURRENT_USER.set(name)
+            return await call_next(request)
+
+    app = mcp.http_app(middleware=[Middleware(TokenAuth)])
+    _jlog(log, logging.INFO, "http_serving", host=host, port=port,
+          employees=list(tokens.values()) or "(none — unauthenticated)")
+    uvicorn.run(app, host=host, port=port, log_config=None)
 
 
 if __name__ == "__main__":

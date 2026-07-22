@@ -1,0 +1,18 @@
+{
+  "default": "Interhi",
+  "profiles": {
+    "Interhi": {
+      "url": "https://interhi-16-0-qa-34923536.dev.odoo.com",
+      "database": "interhi-16-0-qa-34923536",
+      "username": "admin",
+      "password": "CHANGE_ME_API_KEY_OR_PASSWORD"
+    },
+    "production": {
+      "url": "https://my-company.odoo.com",
+      "database": "my-company-prod",
+      "username": "admin",
+      "password": "CHANGE_ME_API_KEY",
+      "readonly": true
+    }
+  }
+}

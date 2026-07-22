@@ -1,0 +1,10 @@
+# Never commit real credentials
+profiles.json
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# local Claude Code state
+.claude/

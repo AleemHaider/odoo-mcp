@@ -1,9 +1,0 @@
-README.md
-pyproject.toml
-server.py
-odoo_mcp.egg-info/PKG-INFO
-odoo_mcp.egg-info/SOURCES.txt
-odoo_mcp.egg-info/dependency_links.txt
-odoo_mcp.egg-info/entry_points.txt
-odoo_mcp.egg-info/requires.txt
-odoo_mcp.egg-info/top_level.txt

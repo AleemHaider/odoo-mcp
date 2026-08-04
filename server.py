@@ -75,7 +75,31 @@ def _load_profiles() -> tuple[dict[str, dict], str]:
     return profiles, "default"
 
 
-PROFILES, DEFAULT_PROFILE = _load_profiles()
+# Hot-reload state: profiles are re-read whenever profiles.json changes on
+# disk, so edited credentials take effect without restarting the server.
+_CFG_STATE: dict[str, Any] = {"sig": None, "profiles": {}, "default": None}
+
+
+def _current_profiles() -> tuple[dict[str, dict], str]:
+    """Return (profiles, default), reloading profiles.json if it changed.
+
+    The file's mtime+size is checked on every call; when it differs the file
+    is re-parsed and the cached Odoo connections are dropped, so pointing the
+    JSON at a different instance reconnects on the next tool call.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    cfg_path = os.environ.get("ODOO_PROFILES_FILE", os.path.join(here, "profiles.json"))
+    try:
+        st = os.stat(cfg_path)
+        sig: tuple | None = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = None
+
+    if sig != _CFG_STATE["sig"] or _CFG_STATE["default"] is None:
+        profiles, default = _load_profiles()
+        _CFG_STATE.update(sig=sig, profiles=profiles, default=default)
+        _authenticate.cache_clear()
+    return _CFG_STATE["profiles"], _CFG_STATE["default"]
 
 
 # --------------------------------------------------------------------------- #
@@ -91,12 +115,14 @@ def _authenticate(profile_name: str) -> tuple[Any, str, int, str]:
     """Authenticate against Odoo and cache (models_proxy, db, uid, password).
 
     Cached per-profile so we don't re-authenticate on every tool call.
+    The cache is cleared by _current_profiles() whenever profiles.json changes.
     """
-    p = PROFILES.get(profile_name)
+    profiles = _CFG_STATE["profiles"]
+    p = profiles.get(profile_name)
     if p is None:
         raise OdooError(
             f"Unknown profile '{profile_name}'. "
-            f"Available: {', '.join(PROFILES) or '(none)'}."
+            f"Available: {', '.join(profiles) or '(none)'}."
         )
 
     url = p["url"].rstrip("/")
@@ -121,11 +147,13 @@ def _authenticate(profile_name: str) -> tuple[Any, str, int, str]:
 
 
 def _client(profile: str | None) -> tuple[Any, str, int, str]:
-    return _authenticate(profile or DEFAULT_PROFILE)
+    _, default = _current_profiles()
+    return _authenticate(profile or default)
 
 
 def _is_readonly(profile: str | None) -> bool:
-    return bool(PROFILES.get(profile or DEFAULT_PROFILE, {}).get("readonly"))
+    profiles, default = _current_profiles()
+    return bool(profiles.get(profile or default, {}).get("readonly"))
 
 
 def _kw(profile: str | None, model: str, method: str,
@@ -305,8 +333,9 @@ def _ok(data: dict) -> dict:
 
 def _guard_write(profile: str | None) -> None:
     if _is_readonly(profile):
+        _, default = _current_profiles()
         raise OdooError(
-            f"Profile '{profile or DEFAULT_PROFILE}' is marked read-only. "
+            f"Profile '{profile or default}' is marked read-only. "
             "Refusing to mutate data. Remove `\"readonly\": true` from the "
             "profile to allow writes."
         )
@@ -338,17 +367,18 @@ def list_available_profiles() -> dict:
     Always call this FIRST so you know which environment you are pointing at.
     Returns an array of {name, url, database, is_default, readonly}.
     """
+    profiles, default = _current_profiles()
     rows = [
         {
             "name": name,
             "url": p.get("url"),
             "database": p.get("database"),
-            "is_default": name == DEFAULT_PROFILE,
+            "is_default": name == default,
             "readonly": bool(p.get("readonly")),
         }
-        for name, p in PROFILES.items()
+        for name, p in profiles.items()
     ]
-    return _ok({"profiles": rows, "default": DEFAULT_PROFILE})
+    return _ok({"profiles": rows, "default": default})
 
 
 @mcp.tool()
@@ -359,10 +389,11 @@ def get_version(profile: str | None = None) -> dict:
     Useful to decide method/field compatibility per version.
     """
     models, db, uid, key = _client(profile)
-    url = PROFILES[profile or DEFAULT_PROFILE]["url"].rstrip("/")
+    profiles, default = _current_profiles()
+    url = profiles[profile or default]["url"].rstrip("/")
     common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True)
     info = common.version()
-    return _ok({"profile": profile or DEFAULT_PROFILE, "version": info})
+    return _ok({"profile": profile or default, "version": info})
 
 
 @mcp.tool()
@@ -738,9 +769,10 @@ def main() -> None:
     `uvx --from git+https://github.com/AleemHaider/odoo-mcp odoo-mcp`.
     """
     # stdio transport — how Claude Desktop / Claude Code launch a local server.
+    profiles, default = _current_profiles()
     print(
-        f"[Odoo MCP Multi] profiles: {', '.join(PROFILES)} "
-        f"| default: {DEFAULT_PROFILE}",
+        f"[Odoo MCP Multi] profiles: {', '.join(profiles)} "
+        f"| default: {default}",
         file=sys.stderr,
     )
     mcp.run()

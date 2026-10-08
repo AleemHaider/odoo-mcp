@@ -1,0 +1,10 @@
+# Local HTTP run of the server (e.g. before putting it behind a public domain).
+#   cp .env.example .env   # fill it in
+#   docker compose up --build
+services:
+  odoo-mcp:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

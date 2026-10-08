@@ -121,7 +121,92 @@ Add to `claude_desktop_config.json`
 claude mcp add odoo -- python "/absolute/path/to/odoo mcp/server.py"
 ```
 
-Restart the client; the 12 tools appear automatically.
+Restart the client; the 13 tools appear automatically.
+
+---
+
+## Use it as a claude.ai connector (remote HTTP + OAuth)
+
+Claude Desktop and Claude Code launch the server locally over stdio. A
+**claude.ai custom connector** is different: Anthropic's servers connect to
+*your* server over HTTPS, so it must be reachable on a public URL and must
+authenticate the caller. The same `server.py` does this when
+`MCP_TRANSPORT=http`.
+
+```
+claude.ai ──HTTPS + OAuth──► https://odoo-mcp.example.com/mcp ──XML-RPC──► Odoo
+```
+
+### 1. Pick an auth mode
+
+| `MCP_AUTH` | Works in claude.ai? | What it is |
+|---|---|---|
+| `github` | ✅ | Users log in with GitHub. Needs a GitHub OAuth App. |
+| `google` | ✅ | Users log in with Google. Needs a Google OAuth client. |
+| `auth0` / `workos` | ✅ | Hosted identity providers. |
+| `jwt` | ✅ (with your own IdP) | Verifies tokens minted elsewhere via JWKS. |
+| `token` | ❌ (Claude Code / curl only) | Static bearer tokens. |
+| `none` | ❌ never deploy this | Only with `MCP_ALLOW_UNAUTHENTICATED=1`, local testing. |
+
+> **Always set `MCP_ALLOWED_USERS`** for `github`/`google`. OAuth proves *who*
+> someone is; the allowlist decides whether they may touch your Odoo. Without
+> it, any GitHub/Google account can log in.
+
+For `github`: create an OAuth App at <https://github.com/settings/developers>
+with **Authorization callback URL** = `https://odoo-mcp.example.com/auth/callback`.
+For `google`: create an OAuth client (Web application) in Google Cloud Console
+with the same redirect URI.
+
+### 2. Configure
+
+```bash
+cp .env.example .env     # fill in Odoo creds, MCP_PUBLIC_URL, MCP_AUTH, OAUTH_*, MCP_ALLOWED_USERS
+```
+
+Odoo credentials stay on the server as env vars; Claude never sees them.
+Consider `ODOO_READONLY=1` for a first deployment — `unlink` and `execute_kw`
+can delete or mutate anything.
+
+### 3. Deploy
+
+Any host that gives you an HTTPS domain works. With Docker:
+
+```bash
+docker build -t odoo-mcp .
+docker run -d -p 8000:8000 --env-file .env odoo-mcp
+```
+
+Or without Docker: `pip install .` then `odoo-mcp` with the same env vars.
+Put it behind TLS (Caddy, nginx, Cloudflare Tunnel, or your PaaS's built-in
+HTTPS on Fly.io / Railway / Render). `MCP_PUBLIC_URL` must equal the public
+origin, since OAuth redirects back to it.
+
+Sanity check from outside:
+```bash
+curl https://odoo-mcp.example.com/.well-known/oauth-protected-resource/mcp
+```
+should return JSON naming your server as the resource.
+
+### 4. Add it in claude.ai
+
+Settings → Connectors → **Add custom connector** → URL
+`https://odoo-mcp.example.com/mcp`. Leave client ID/secret blank: the server
+supports Dynamic Client Registration, so claude.ai registers itself. You'll be
+sent through your provider's login, then the 13 tools appear.
+
+### Local test without OAuth
+
+```bash
+MCP_TRANSPORT=http MCP_AUTH=token MCP_BEARER_TOKENS=dev-secret \
+ODOO_URL=... ODOO_DB=... ODOO_USER=... ODOO_PASSWORD=... python server.py
+```
+```bash
+claude mcp add odoo-remote --transport http http://localhost:8000/mcp \
+  --header "Authorization: Bearer dev-secret"
+```
+
+All HTTP settings are documented at the top of [`server.py`](./server.py) and in
+[`.env.example`](./.env.example).
 
 ---
 

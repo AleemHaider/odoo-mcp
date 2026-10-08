@@ -8,13 +8,37 @@ This is a faithful, from-scratch reimplementation of the server described in
 envelope on every read, five output formats, Odoo "command tuple" support and
 verbose, actionable error handling.
 
-Transport: stdio (the standard way an MCP client such as Claude Desktop /
-Claude Code launches a local server).
+Transport: stdio by default (how Claude Desktop / Claude Code launch a local
+server).  Set MCP_TRANSPORT=http to serve Streamable HTTP instead, which is
+what a remote claude.ai connector needs.  See "Remote / claude.ai connector"
+below and in README.md.
 
 Run:      python server.py
 Config:   profiles.json  (copy from profiles.example.json) or env vars
           ODOO_URL / ODOO_DB / ODOO_USER / ODOO_PASSWORD for a single "default"
           profile.
+
+Remote / claude.ai connector (all optional, only read when MCP_TRANSPORT=http):
+    MCP_HOST                bind address              (default 0.0.0.0)
+    MCP_PORT                bind port                 (default 8000)
+    MCP_PATH                endpoint path             (default /mcp)
+    MCP_PUBLIC_URL          public https origin, e.g. https://odoo-mcp.example.com
+                            (required for OAuth providers — it is where the
+                            provider redirects back to)
+    MCP_AUTH                none | token | github | google | auth0 | workos | jwt
+    MCP_ALLOWED_USERS       comma-separated allowlist matched against the
+                            authenticated user's email / login / subject.
+                            Strongly recommended for github/google, otherwise
+                            ANY account at that provider can log in.
+    MCP_ALLOW_UNAUTHENTICATED=1   required to run http with MCP_AUTH=none.
+
+  token:   MCP_BEARER_TOKENS   comma-separated static bearer tokens (for
+                               Claude Code / curl; claude.ai needs OAuth)
+  github:  OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET
+  google:  OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET
+  auth0:   OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, AUTH0_CONFIG_URL, AUTH0_AUDIENCE
+  workos:  OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, WORKOS_AUTHKIT_DOMAIN
+  jwt:     JWT_JWKS_URI, JWT_ISSUER, JWT_AUDIENCE   (verify tokens issued elsewhere)
 """
 
 from __future__ import annotations
@@ -31,8 +55,158 @@ from html import escape
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.middleware import Middleware, MiddlewareContext
 
-mcp = FastMCP("Odoo MCP Multi")
+# --------------------------------------------------------------------------- #
+# 0. Transport + auth (env-driven; stdio needs none of this)
+# --------------------------------------------------------------------------- #
+
+# On Vercel the module is imported as an ASGI app, never launched over stdio.
+TRANSPORT = os.environ.get("MCP_TRANSPORT", "http" if os.environ.get("VERCEL") else "stdio").strip().lower()
+if TRANSPORT in ("streamable-http", "streamable_http"):
+    TRANSPORT = "http"
+if TRANSPORT not in ("stdio", "http"):
+    raise RuntimeError(f"MCP_TRANSPORT must be 'stdio' or 'http', got {TRANSPORT!r}")
+
+
+def _env(name: str, *, required: bool = False, default: str | None = None) -> str | None:
+    val = os.environ.get(name, default)
+    if required and not val:
+        raise RuntimeError(f"MCP_AUTH={os.environ.get('MCP_AUTH')} requires env var {name}")
+    return val
+
+
+def _csv_env(name: str) -> list[str]:
+    return [s.strip() for s in os.environ.get(name, "").split(",") if s.strip()]
+
+
+def _build_auth():
+    """Return a FastMCP AuthProvider for HTTP mode, or None for stdio.
+
+    stdio is launched by a trusted local client, so it is never authenticated.
+    HTTP is reachable over the network, so it refuses to start without auth
+    unless MCP_ALLOW_UNAUTHENTICATED=1 is set explicitly.
+    """
+    if TRANSPORT != "http":
+        return None
+
+    mode = (os.environ.get("MCP_AUTH") or "none").strip().lower()
+    public_url = os.environ.get("MCP_PUBLIC_URL")
+
+    if mode == "none":
+        if os.environ.get("MCP_ALLOW_UNAUTHENTICATED", "").lower() not in ("1", "true", "yes"):
+            raise RuntimeError(
+                "Refusing to serve HTTP without authentication: anyone who can reach "
+                "this URL would hold your Odoo credentials. Set MCP_AUTH (github, "
+                "google, auth0, workos, jwt, token) or, for local testing only, "
+                "MCP_ALLOW_UNAUTHENTICATED=1."
+            )
+        return None
+
+    if mode == "token":
+        from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+        tokens = _csv_env("MCP_BEARER_TOKENS")
+        if not tokens:
+            raise RuntimeError("MCP_AUTH=token requires MCP_BEARER_TOKENS (comma-separated)")
+        return StaticTokenVerifier(
+            tokens={t: {"client_id": f"token-{i}", "scopes": []} for i, t in enumerate(tokens)}
+        )
+
+    if mode == "jwt":
+        from fastmcp.server.auth.providers.jwt import JWTVerifier
+        return JWTVerifier(
+            jwks_uri=_env("JWT_JWKS_URI", required=True),
+            issuer=_env("JWT_ISSUER"),
+            audience=_env("JWT_AUDIENCE"),
+            base_url=public_url,
+        )
+
+    # The remaining modes are full OAuth providers: claude.ai discovers them via
+    # /.well-known, registers itself dynamically, and sends the user through the
+    # provider's login page. They all need the public base URL for redirects.
+    if not public_url:
+        raise RuntimeError(f"MCP_AUTH={mode} requires MCP_PUBLIC_URL (e.g. https://odoo-mcp.example.com)")
+
+    if mode == "github":
+        from fastmcp.server.auth.providers.github import GitHubProvider
+        return GitHubProvider(
+            client_id=_env("OAUTH_CLIENT_ID", required=True),
+            client_secret=_env("OAUTH_CLIENT_SECRET", required=True),
+            base_url=public_url,
+            required_scopes=["user"],
+        )
+    if mode == "google":
+        from fastmcp.server.auth.providers.google import GoogleProvider
+        return GoogleProvider(
+            client_id=_env("OAUTH_CLIENT_ID", required=True),
+            client_secret=_env("OAUTH_CLIENT_SECRET", required=True),
+            base_url=public_url,
+            required_scopes=["openid", "https://www.googleapis.com/auth/userinfo.email"],
+        )
+    if mode == "auth0":
+        from fastmcp.server.auth.providers.auth0 import Auth0Provider
+        return Auth0Provider(
+            config_url=_env("AUTH0_CONFIG_URL", required=True),
+            client_id=_env("OAUTH_CLIENT_ID", required=True),
+            client_secret=_env("OAUTH_CLIENT_SECRET", required=True),
+            audience=_env("AUTH0_AUDIENCE", required=True),
+            base_url=public_url,
+        )
+    if mode == "workos":
+        from fastmcp.server.auth.providers.workos import WorkOSProvider
+        return WorkOSProvider(
+            client_id=_env("OAUTH_CLIENT_ID", required=True),
+            client_secret=_env("OAUTH_CLIENT_SECRET", required=True),
+            authkit_domain=_env("WORKOS_AUTHKIT_DOMAIN", required=True),
+            base_url=public_url,
+        )
+
+    raise RuntimeError(
+        f"Unknown MCP_AUTH={mode!r}. Use none, token, github, google, auth0, workos or jwt."
+    )
+
+
+class AllowlistMiddleware(Middleware):
+    """Block tool calls from authenticated users not in MCP_ALLOWED_USERS.
+
+    OAuth providers like GitHub/Google will happily log in *any* account they
+    host; this is what turns "has a GitHub account" into "is allowed to touch
+    our Odoo". Matches (case-insensitively) against the token's email, login,
+    preferred_username or subject claim.
+    """
+
+    def __init__(self, allowed: list[str]):
+        self.allowed = {a.lower() for a in allowed}
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        token = get_access_token()
+        if token is not None:  # None only when auth is disabled
+            claims = token.claims or {}
+            identities = {
+                str(v).lower()
+                for v in (
+                    claims.get("email"), claims.get("login"),
+                    claims.get("preferred_username"), claims.get("sub"),
+                    token.subject, token.client_id,
+                )
+                if v
+            }
+            if not identities & self.allowed:
+                who = claims.get("email") or claims.get("login") or token.subject or token.client_id
+                raise ToolError(f"User {who!r} is not in MCP_ALLOWED_USERS.")
+        return await call_next(context)
+
+
+_AUTH = _build_auth()
+_ALLOWED_USERS = _csv_env("MCP_ALLOWED_USERS")
+
+mcp = FastMCP(
+    "Odoo MCP Multi",
+    auth=_AUTH,
+    middleware=[AllowlistMiddleware(_ALLOWED_USERS)] if _ALLOWED_USERS else None,
+)
 
 # --------------------------------------------------------------------------- #
 # 1. Profile configuration (defined on the HOST, never inside Claude)
@@ -762,20 +936,48 @@ def _cell(value: Any) -> str:
 # Entrypoint
 # --------------------------------------------------------------------------- #
 
+# ASGI app for hosts that import this module instead of running main()
+# (Vercel's Python runtime, `uvicorn server:app`). Stateless so every request
+# can land on a fresh serverless instance.
+app = (
+    mcp.http_app(path=os.environ.get("MCP_PATH", "/mcp"), stateless_http=True)
+    if TRANSPORT == "http"
+    else None
+)
+
+
 def main() -> None:
     """Console-script entry point (see pyproject.toml [project.scripts]).
 
     Lets the server be launched as `odoo-mcp` after install, including via
     `uvx --from git+https://github.com/AleemHaider/odoo-mcp odoo-mcp`.
     """
-    # stdio transport — how Claude Desktop / Claude Code launch a local server.
     profiles, default = _current_profiles()
     print(
         f"[Odoo MCP Multi] profiles: {', '.join(profiles)} "
         f"| default: {default}",
         file=sys.stderr,
     )
-    mcp.run()
+
+    if TRANSPORT == "stdio":
+        # How Claude Desktop / Claude Code launch a local server.
+        mcp.run()
+        return
+
+    host = os.environ.get("MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("MCP_PORT", "8000"))
+    path = os.environ.get("MCP_PATH", "/mcp")
+    auth_mode = (os.environ.get("MCP_AUTH") or "none").lower()
+    public = os.environ.get("MCP_PUBLIC_URL") or f"http://{host}:{port}"
+    print(
+        f"[Odoo MCP Multi] http transport | auth={auth_mode} | "
+        f"allowlist={len(_ALLOWED_USERS) or 'off'} | endpoint={public.rstrip('/')}{path}",
+        file=sys.stderr,
+    )
+    # Streamable HTTP — what claude.ai custom connectors and `claude mcp add
+    # --transport http` speak. stateless keeps the server safe behind load
+    # balancers / multiple replicas (no sticky sessions needed).
+    mcp.run(transport="http", host=host, port=port, path=path, stateless_http=True)
 
 
 if __name__ == "__main__":

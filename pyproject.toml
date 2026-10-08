@@ -11,7 +11,11 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "aleemhaider" }]
 keywords = ["odoo", "mcp", "model-context-protocol", "claude", "xmlrpc", "erp"]
-dependencies = ["fastmcp>=2.0.0"]
+dependencies = ["fastmcp>=3.0.0"]
+
+[project.optional-dependencies]
+# Redis-backed OAuth/credential storage for the public multi-tenant connector.
+remote = ["redis>=5.0"]
 
 [project.urls]
 Homepage = "https://github.com/AleemHaider/odoo-mcp"
@@ -24,4 +28,4 @@ odoo-mcp = "server:main"
 
 [tool.setuptools]
 # Single top-level module; smoke_test.py stays out of the installed package.
-py-modules = ["server"]
+py-modules = ["server", "odoo_auth"]

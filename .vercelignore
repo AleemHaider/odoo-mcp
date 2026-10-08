@@ -1,0 +1,18 @@
+# Credentials stay out of the deployment; Vercel env vars supply them.
+profiles.json
+.env
+.env.*
+.claude
+__pycache__
+*.pyc
+.venv
+venv
+build
+dist
+*.egg-info
+*.zip
+*.pdf
+Dockerfile
+docker-compose.yml
+.dockerignore
+smoke_test.py

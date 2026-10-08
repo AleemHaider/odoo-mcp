@@ -125,6 +125,64 @@ Restart the client; the 13 tools appear automatically.
 
 ---
 
+## Public connector: anyone signs in with their own Odoo (`MCP_AUTH=odoo`)
+
+The modes above protect *one* Odoo with *your* GitHub/Google login. `odoo`
+mode is different: it is a **public, multi-tenant connector**. Any claude.ai
+user adds the URL, and the OAuth login page asks for **their** Odoo URL,
+database, username and API key. No Odoo credentials live on the server.
+
+```
+claude.ai ─OAuth─► /login (Odoo creds form) ─validate─► user's Odoo
+          ─bearer─► /mcp ─(creds from token)─► user's Odoo
+```
+
+- Each user's credentials are validated against their Odoo, **encrypted** with
+  `MCP_SECRET_KEY`, and stored in Redis under an opaque subject. Tokens are
+  stored hashed; the store never holds a usable token or plaintext key.
+- A **read-only** checkbox on the login page blocks create/write/unlink/import
+  for that connection.
+- Access tokens last 1 hour and refresh silently for 30 days. Users revoke by
+  deleting the API key in Odoo or removing the connector in Claude.
+- Failed logins are rate-limited per IP.
+
+### Deploy on Vercel (container)
+
+[`Dockerfile.vercel`](./Dockerfile.vercel) is auto-detected by Vercel and runs
+the server as a scale-to-zero container. Because every request may hit a fresh
+instance, OAuth state **must** live in Redis.
+
+1. Create the project: `vercel link` (or import the repo in the dashboard).
+2. Add **Upstash Redis** from the Vercel Marketplace (Storage tab). It injects a
+   `REDIS_URL`/`KV_URL`-style variable; copy its value into `MCP_STORAGE_URL`.
+3. Set env vars (Project → Settings → Environment Variables):
+
+   | Var | Value |
+   |---|---|
+   | `MCP_AUTH` | `odoo` |
+   | `MCP_PUBLIC_URL` | `https://<your-project>.vercel.app` (or your domain) |
+   | `MCP_SECRET_KEY` | output of `openssl rand -hex 32` |
+   | `MCP_STORAGE_URL` | the Upstash `rediss://…` URL |
+   | `MCP_SERVER_NAME` | name shown on the login page (optional) |
+
+4. `vercel deploy --prod`.
+5. Check `https://<domain>/.well-known/oauth-protected-resource/mcp` returns JSON.
+
+Users then add `https://<domain>/mcp` as a custom connector in claude.ai,
+click Connect, and fill in their Odoo details once.
+
+The same image runs anywhere Docker runs (`docker run --env-file .env
+-p 8000:8000 odoo-mcp`); only the Redis requirement is Vercel-specific.
+
+### Getting into the claude.ai connector directory
+
+Working by URL as a custom connector needs nothing from Anthropic. Appearing
+in the browsable directory is a separate partnership/listing process run by
+Anthropic; the server already meets the technical requirements (remote
+Streamable HTTP, OAuth 2.1 with PKCE and dynamic client registration).
+
+---
+
 ## Use it as a claude.ai connector (remote HTTP + OAuth)
 
 Claude Desktop and Claude Code launch the server locally over stdio. A
@@ -145,6 +203,7 @@ claude.ai ──HTTPS + OAuth──► https://odoo-mcp.example.com/mcp ──XM
 | `google` | ✅ | Users log in with Google. Needs a Google OAuth client. |
 | `auth0` / `workos` | ✅ | Hosted identity providers. |
 | `jwt` | ✅ (with your own IdP) | Verifies tokens minted elsewhere via JWKS. |
+| `odoo` | ✅ | **Public multi-tenant**: users sign in with their own Odoo. See the section above. |
 | `token` | ❌ (Claude Code / curl only) | Static bearer tokens. |
 | `none` | ❌ never deploy this | Only with `MCP_ALLOW_UNAUTHENTICATED=1`, local testing. |
 

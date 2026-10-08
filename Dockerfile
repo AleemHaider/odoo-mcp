@@ -13,8 +13,8 @@ ENV PYTHONUNBUFFERED=1 \
     MCP_PORT=8000
 
 WORKDIR /app
-COPY pyproject.toml README.md server.py ./
-RUN pip install --no-cache-dir .
+COPY pyproject.toml README.md server.py odoo_auth.py ./
+RUN pip install --no-cache-dir ".[remote]"
 
 # Run as an unprivileged user; nothing here needs root.
 RUN useradd --create-home --uid 1000 mcp

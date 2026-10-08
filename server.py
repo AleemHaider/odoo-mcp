@@ -25,7 +25,7 @@ Remote / claude.ai connector (all optional, only read when MCP_TRANSPORT=http):
     MCP_PUBLIC_URL          public https origin, e.g. https://odoo-mcp.example.com
                             (required for OAuth providers — it is where the
                             provider redirects back to)
-    MCP_AUTH                none | token | github | google | auth0 | workos | jwt
+    MCP_AUTH                none | token | github | google | auth0 | workos | jwt | odoo
     MCP_ALLOWED_USERS       comma-separated allowlist matched against the
                             authenticated user's email / login / subject.
                             Strongly recommended for github/google, otherwise
@@ -39,6 +39,14 @@ Remote / claude.ai connector (all optional, only read when MCP_TRANSPORT=http):
   auth0:   OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, AUTH0_CONFIG_URL, AUTH0_AUDIENCE
   workos:  OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, WORKOS_AUTHKIT_DOMAIN
   jwt:     JWT_JWKS_URI, JWT_ISSUER, JWT_AUDIENCE   (verify tokens issued elsewhere)
+  odoo:    PUBLIC multi-tenant connector. The OAuth login page asks each user
+           for THEIR Odoo URL / database / username / API key; no server-side
+           Odoo credentials at all. Needs:
+             MCP_SECRET_KEY     long random string; encrypts stored credentials
+                                and tokens (rotate = everyone re-logs-in)
+             MCP_STORAGE_URL    redis://… (required in production; unset = memory,
+                                which is wiped on restart and NOT shared across
+                                serverless instances)
 """
 
 from __future__ import annotations
@@ -123,6 +131,23 @@ def _build_auth():
             base_url=public_url,
         )
 
+    if mode == "odoo":
+        if not public_url:
+            raise RuntimeError("MCP_AUTH=odoo requires MCP_PUBLIC_URL (e.g. https://odoo-mcp.example.com)")
+        secret = _env("MCP_SECRET_KEY", required=True)
+        if len(secret) < 16:
+            raise RuntimeError("MCP_SECRET_KEY must be at least 16 characters (use 32+ random ones)")
+        storage_url = os.environ.get("MCP_STORAGE_URL")
+        if not storage_url:
+            print("[Odoo MCP Multi] WARNING: MCP_STORAGE_URL not set; using in-memory storage. "
+                  "Logins are lost on restart and not shared between instances.", file=sys.stderr)
+        from odoo_auth import OdooLoginProvider, build_storage
+        return OdooLoginProvider(
+            base_url=public_url,
+            storage=build_storage(storage_url, secret),
+            server_name=os.environ.get("MCP_SERVER_NAME", "Odoo MCP"),
+        )
+
     # The remaining modes are full OAuth providers: claude.ai discovers them via
     # /.well-known, registers itself dynamically, and sends the user through the
     # provider's login page. They all need the public base URL for redirects.
@@ -164,7 +189,7 @@ def _build_auth():
         )
 
     raise RuntimeError(
-        f"Unknown MCP_AUTH={mode!r}. Use none, token, github, google, auth0, workos or jwt."
+        f"Unknown MCP_AUTH={mode!r}. Use none, token, github, google, auth0, workos, jwt or odoo."
     )
 
 
@@ -201,6 +226,8 @@ class AllowlistMiddleware(Middleware):
 
 _AUTH = _build_auth()
 _ALLOWED_USERS = _csv_env("MCP_ALLOWED_USERS")
+# Multi-tenant: every request carries its own Odoo credentials (see odoo_auth.py).
+MULTI_TENANT = TRANSPORT == "http" and (os.environ.get("MCP_AUTH") or "").strip().lower() == "odoo"
 
 mcp = FastMCP(
     "Odoo MCP Multi",
@@ -320,12 +347,32 @@ def _authenticate(profile_name: str) -> tuple[Any, str, int, str]:
     return models, db, uid, key
 
 
+def _tenant() -> dict:
+    """Odoo credentials of the user behind the current request (multi-tenant mode).
+
+    OdooLoginProvider.load_access_token() verified the bearer token and put the
+    decrypted credentials into the token's claims; they live only for this
+    request and never appear in tool output.
+    """
+    token = get_access_token()
+    creds = (token.claims or {}).get("odoo") if token else None
+    if not creds:
+        raise OdooError("Not signed in to Odoo. Reconnect this connector in Claude to log in again.")
+    return creds
+
+
 def _client(profile: str | None) -> tuple[Any, str, int, str]:
+    if MULTI_TENANT:
+        c = _tenant()
+        models = xmlrpc.client.ServerProxy(f"{c['url']}/xmlrpc/2/object", allow_none=True)
+        return models, c["database"], int(c["uid"]), c["api_key"]
     _, default = _current_profiles()
     return _authenticate(profile or default)
 
 
 def _is_readonly(profile: str | None) -> bool:
+    if MULTI_TENANT:
+        return bool(_tenant().get("readonly"))
     profiles, default = _current_profiles()
     return bool(profiles.get(profile or default, {}).get("readonly"))
 
@@ -507,6 +554,11 @@ def _ok(data: dict) -> dict:
 
 def _guard_write(profile: str | None) -> None:
     if _is_readonly(profile):
+        if MULTI_TENANT:
+            raise OdooError(
+                "This connection was set up as read-only. Refusing to mutate data. "
+                "Reconnect the connector in Claude without the read-only option to allow writes."
+            )
         _, default = _current_profiles()
         raise OdooError(
             f"Profile '{profile or default}' is marked read-only. "
@@ -541,6 +593,13 @@ def list_available_profiles() -> dict:
     Always call this FIRST so you know which environment you are pointing at.
     Returns an array of {name, url, database, is_default, readonly}.
     """
+    if MULTI_TENANT:
+        c = _tenant()
+        return _ok({"profiles": [{
+            "name": "default", "url": c["url"], "database": c["database"],
+            "user": c.get("display_name") or c.get("username"),
+            "is_default": True, "readonly": bool(c.get("readonly")),
+        }], "default": "default"})
     profiles, default = _current_profiles()
     rows = [
         {
@@ -562,12 +621,16 @@ def get_version(profile: str | None = None) -> dict:
 
     Useful to decide method/field compatibility per version.
     """
-    models, db, uid, key = _client(profile)
-    profiles, default = _current_profiles()
-    url = profiles[profile or default]["url"].rstrip("/")
+    _client(profile)  # validates the profile / signed-in user first
+    if MULTI_TENANT:
+        url, name = _tenant()["url"], "default"
+    else:
+        profiles, default = _current_profiles()
+        name = profile or default
+        url = profiles[name]["url"].rstrip("/")
     common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True)
     info = common.version()
-    return _ok({"profile": profile or default, "version": info})
+    return _ok({"profile": name, "version": info})
 
 
 @mcp.tool()
@@ -952,12 +1015,15 @@ def main() -> None:
     Lets the server be launched as `odoo-mcp` after install, including via
     `uvx --from git+https://github.com/AleemHaider/odoo-mcp odoo-mcp`.
     """
-    profiles, default = _current_profiles()
-    print(
-        f"[Odoo MCP Multi] profiles: {', '.join(profiles)} "
-        f"| default: {default}",
-        file=sys.stderr,
-    )
+    if MULTI_TENANT:
+        print("[Odoo MCP Multi] multi-tenant: users sign in with their own Odoo", file=sys.stderr)
+    else:
+        profiles, default = _current_profiles()
+        print(
+            f"[Odoo MCP Multi] profiles: {', '.join(profiles)} "
+            f"| default: {default}",
+            file=sys.stderr,
+        )
 
     if TRANSPORT == "stdio":
         # How Claude Desktop / Claude Code launch a local server.
@@ -965,7 +1031,7 @@ def main() -> None:
         return
 
     host = os.environ.get("MCP_HOST", "0.0.0.0")
-    port = int(os.environ.get("MCP_PORT", "8000"))
+    port = int(os.environ.get("MCP_PORT") or os.environ.get("PORT") or "8000")
     path = os.environ.get("MCP_PATH", "/mcp")
     auth_mode = (os.environ.get("MCP_AUTH") or "none").lower()
     public = os.environ.get("MCP_PUBLIC_URL") or f"http://{host}:{port}"
